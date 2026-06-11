@@ -166,6 +166,11 @@ class AnomalyDetector:
         return match.group(1) if match else "00"
 
     @staticmethod
+    def _parse_name(path: str) -> str:
+        """Extract name from a file path."""
+        return os.path.basename(path).split(".")[0] + ".wav"
+
+    @staticmethod
     def _load_lines(filepath: str) -> List[str]:
         """Read lines from *filepath* safely (closes the handle)."""
         with open(filepath, "r") as fh:
@@ -437,6 +442,10 @@ class AnomalyDetector:
                     sections = np.array(
                         [self._parse_section(l) for l in self._load_lines(paths_file)]
                     )
+                    names = np.array(
+                        [self._parse_name(l) for l in self._load_lines(paths_file)]
+                    )
+                    break
                 break  # metadata only needed from one path
 
             # --- Score every embedding path ---
@@ -463,6 +472,20 @@ class AnomalyDetector:
             scorer_names = list(fused.keys())
             stacked = np.stack([fused[name] for name in scorer_names])
             combined = np.min(stacked, axis=0)  # Min-pooling
+            norm_combined = (combined - combined.min()) / (combined.max() - combined.min())
+            
+            # Save to csv files
+            decision_file = f"results/decision_result_{machine}.csv"
+            score_file = f"results/anomaly_score_{machine}.csv"
+
+            # Write paired values: names[x], norm_combined[x]
+            with open(score_file, "w") as f:
+                for name, score in zip(names, combined):
+                    f.write(f"{name},{score}\n")
+
+            with open(decision_file, "w") as f:
+                for name, score in zip(names, norm_combined):
+                    f.write(f"{name},{1 if score > 0.5 else 0}\n")
 
             # --- NEW: Count how many times each scorer provided the minimum ---
             # np.argmin gets the row index (0, 1, 2, etc.) of the lowest value for each column

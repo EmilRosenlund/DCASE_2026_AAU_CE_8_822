@@ -1,0 +1,54 @@
+# ENVIRONMENT CONFIGURATION
+environment: "local"
+
+paths:
+  # Paths based on local environment
+  local:
+    data: "PATH_TO_DATA_FOLDER"
+    logs: "PATH_TO_LOGS_FOLDER"
+    embeddings: "PATH_TO_EMBEDDINGS_FOLDER"
+    models: "PATH_TO_MODELS_FOLDER"
+    denoised_data: "PATH_TO_DENOISED_DATA_FOLDER"
+
+  # Paths based on ailab
+  ailab:
+    data: "/ceph/project/P8_DCASE/data_2026"
+    logs: "/logs"
+    embeddings: "/ceph/project/P8_DCASE/embeddings/"
+    models: "/ceph/project/P8_DCASE/models"
+    denoised_data: "/ceph/project/P8_DCASE/data_denoised"
+
+preprocessing:
+  # Set to True to use the preprocessing module
+  enabled: false
+  module: "denoise_all.py"
+
+  denoise:
+    filter_length: 256
+    step_size: 0.001
+    use_preroll: true
+    align_phase: true
+    num_workers: -1
+
+embeddings:
+  # Set to True to use the embeddings module
+  enabled: false
+  modules:
+    #- "sslam_stereo_band_16"
+    - "beats_V4_4l_ch0"
+    #- "beats_2026_4l_ch0"
+    
+  params:
+    split: "both"
+    max_samples: 0
+    machine_types: "fan"
+    use_gpu: true
+
+classification:
+  # Set to True to use the classification module
+  enabled: true
+  module: "score_based_fusion_rank"
+
+  params:
+    threshold: 0.5
+    machine_types: ""

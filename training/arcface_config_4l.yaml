@@ -1,0 +1,94 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# training/arcface_config.yaml
+# Full fine-tune of BEATs (or any BaseBackbone) with ArcFace loss.
+# Predict composite identity labels: machine_type + section + domain + attr_str
+# ─────────────────────────────────────────────────────────────────────────────
+
+seed: 42
+
+# ── Data ───────────────────────────────────────────────────────────────────
+data:
+  root: "/ceph/project/P8_DCASE/data_all"
+  # Optional list of extra datasets. Each entry is the path to a data_all.py-style
+  # module file whose class (name ending in "Dataset") will be loaded and concatenated
+  # with the primary dataset for training.
+  # extra_datasets:
+  #   - "/ceph/project/P8_DCASE/my_other_dataset/data_all.py"
+  machine_types: null
+  sample_rate: 16000
+  clip_duration: 10.0
+  separate_channels_as_samples: false  # treat left/right channels as separate samples
+  # Splits to include as training data
+  # train = annotated training clips; supplemental = extra normal machine clips
+  splits:
+    - train
+    - supplemental
+
+# ── Augmentation ───────────────────────────────────────────────────────────
+augmentation:
+  # Real noise clips from supplemental pool are mixed into every augmented view
+  real_noise:
+    enabled: true
+    snr_db_low: 5.0
+    snr_db_high: 20.0
+    prob: 0.8
+  time_shift:
+    enabled: true
+    max_fraction: 0.1
+    prob: 0.5
+  gaussian_noise:
+    enabled: true
+    snr_db_low: 15.0
+    snr_db_high: 35.0
+    prob: 0.3
+
+# ── Backbone ───────────────────────────────────────────────────────────────
+backbone:
+  # Registered backbone type. Currently supported: "beats"
+  # Add new subclasses of BaseBackbone and register under this key.
+  type: "beats"
+  beats:
+    checkpoint: "/ceph/project/P8_DCASE/models/BEATs_iter3_plus_AS2M.pt"
+    pool: "mean"            # "mean" → 768-d | "mean+std" → 1536-d | "first" → 768-d
+    fine_tune_layers: 4 # "all" | integer N (unfreeze top N transformer blocks)
+
+# ── ArcFace head ───────────────────────────────────────────────────────────
+arcface:
+  scale: 64       # s: logit scale
+  margin: 0.19955091677809725       # m: additive angular margin (radians)
+  easy_margin: false
+
+# ── Training ───────────────────────────────────────────────────────────────
+training:
+  epochs: 1000
+  batch_size: 64             # physical per-GPU batch — kept small to fit VRAM
+  grad_accum_steps: 4       # accumulate 4 steps → effective batch = 32
+  mixed_precision: "bf16"   # "bf16" | "fp16" | "none" — L4 GPUs support bf16
+  gradient_checkpointing: true   # trade ~30% compute for ~50% activation memory
+  # Separate learning rates for backbone and ArcFace head
+  lr_backbone: 0.00006454532005270264
+  lr_head: 0.004568598453364803
+  weight_decay: 0.0005103112210114589
+  warmup_epochs: 5          # linear LR warmup then cosine annealing
+  gradient_clip: 1.0
+  early_stopping_patience: 1000   # epochs without loss improvement
+  num_workers: 4            # DataLoader workers per GPU process
+  pin_memory: true
+  target_domain_min_frac: 0.0   # ≥ 25% of every batch from target domain
+  # K-fold cross-validation. 0 or 1 = disabled (single run, no val split).
+  # ≥ 2 = stratified K-fold. Use --fold N CLI arg for SLURM array jobs.
+  cv_folds: 5
+
+# ── WandB ──────────────────────────────────────────────────────────────────
+wandb:
+  enabled: true
+  project: "aau_p8_arcface"
+  run_name: beats_2026_V3_4l_ch0            # null = auto-generated timestamp
+  # Group name in WandB UI. null = auto-set to run_name when cv_folds≥2.
+  # Set explicitly to group sweep trials together.
+  group: null
+
+# ── Output ─────────────────────────────────────────────────────────────────
+output:
+  save_dir: "results"
+  log_level: "INFO"

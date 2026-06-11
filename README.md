@@ -45,4 +45,4 @@ The aim is to keep the individual models simple and independent, then let the fi
 
 ## Project Report
 
-The full report for this project is included in `P8.md`.
+The full report for this project is included in `P8.pdf`.

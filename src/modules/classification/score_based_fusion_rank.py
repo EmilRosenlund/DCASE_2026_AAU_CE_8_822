@@ -101,7 +101,7 @@ class AnomalyDetector:
     }
 
     # Default set of enabled scorers (used when config doesn't specify any)
-    DEFAULT_ENABLED: List[str] = ["knn"]
+    DEFAULT_ENABLED: List[str] = ["knn", "gmm", "gwrp", "ae"]
 
     def __init__(self, config: dict):
         """
@@ -164,6 +164,11 @@ class AnomalyDetector:
         """Extract section ID from a file path."""
         match = re.search(r"section_(\d+)", path)
         return match.group(1) if match else "00"
+    
+    @staticmethod
+    def _parse_name(path: str) -> str:
+        """Extract name from a file path."""
+        return os.path.basename(path).split(".")[0] + ".wav"
 
     @staticmethod
     def _load_lines(filepath: str) -> List[str]:
@@ -428,6 +433,10 @@ class AnomalyDetector:
                     sections = np.array(
                         [self._parse_section(l) for l in self._load_lines(paths_file)]
                     )
+                    names = np.array(
+                        [self._parse_name(l) for l in self._load_lines(paths_file)]
+                    )
+                    break
                 break  # metadata only needed from one path
 
             # --- Score every embedding path ---
@@ -453,6 +462,19 @@ class AnomalyDetector:
 
             stacked = np.stack(list(fused.values()))
             combined = np.min(stacked, axis=0)  # Min-pooling
+
+            # Save to csv files
+            decision_file = f"results/decision_result_{machine}.csv"
+            score_file = f"results/anomaly_score_{machine}.csv"
+
+            # Write paired values: names[x], norm_combined[x]
+            with open(score_file, "w") as f:
+                for name, score in zip(names, combined):
+                    f.write(f"{name},{score}\n")
+
+            with open(decision_file, "w") as f:
+                for name, score in zip(names, combined):
+                    f.write(f"{name},{1 if score > 0.5 else 0}\n")
 
             # --- DCASE evaluation ---
             if y_test is None:

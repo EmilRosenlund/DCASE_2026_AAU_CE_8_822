@@ -11,8 +11,8 @@ The goal is not to rely on a single detector. Instead, the system learns several
 ## Three Model Tracks
 
 - Audio Encoder: a 2-channel + residual autoencoder track for learning compact latent structure.
-- BEATs: a pretrained embedding track for transfer-style representation learning.
-- SSLAM: a stereo embedding track for channel-aware feature extraction.
+- BEATs: a pretrained ViT - further finetuned for a downstream ArcFace Classification task.
+- SSLAM: a pretrained ViT - further finetuned for a downstream ArcFace Classification task.
 
 Each track can be trained independently, tuned separately, and evaluated on its own.
 

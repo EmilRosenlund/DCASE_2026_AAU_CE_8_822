@@ -1,16 +1,16 @@
-"""
+﻿"""
 train_domain_autoencoder.py
-───────────────────────────
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
 Single-machine domain autoencoder.                                          project/simple_autoencoder/train_split_2ch_pre_self.py
 #                                                                               Need to change auc val to not just a center crop
 Goal: encode one target machine's domains into distinct, separated clusters
 in latent space. All other machines are collapsed to a single "other" class
-(domain_label = 0) and are excluded from both clustering losses — the
+(domain_label = 0) and are excluded from both clustering losses ÔÇö the
 autoencoder simply reconstructs them without trying to cluster them.
 
 Domain label convention
-  0          → "other" (every machine that is NOT the target machine)
-  1 … K      → domain IDs for the target machine (re-indexed from 1)
+  0          ÔåÆ "other" (every machine that is NOT the target machine)
+  1 ÔÇª K      ÔåÆ domain IDs for the target machine (re-indexed from 1)
 
 The DomainClusteringLoss only operates on samples where domain_label > 0.
 
@@ -43,13 +43,32 @@ from sklearn.manifold import TSNE
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 
-# ── project imports ───────────────────────────────────────────────────────────
+# ÔöÇÔöÇ project imports ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_dir = os.path.dirname(os.path.dirname(current_dir))
 sys.path.append(os.path.join(project_dir, "project", "utils"))
 
-from dataloader import DCASE_Dataset
-from model_architecture2 import DomainClusteringLoss
+from utils.dataloader import (
+    DCASE_Dataset,
+    DCASEAudioDataset,
+    AUCValidationDataset,
+    build_datasets as build_datasets_from_utils,
+    generate_reference_embeddings,
+    validate_auc,
+    aggregate_windowed_embeddings,
+    discover_target_test_samples,
+    discover_target_test_auc_samples,
+)
+from model_parts import (
+    DomainClusteringLoss,
+    ConvBlock1d,
+    DeconvBlock1d,
+    StereoResidualEncoder,
+    StereoResidualDecoder,
+    DomainAutoencoder,
+    StereoReconstructionLoss,
+    StereoTemporalConsistencyLoss,
+)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -60,9 +79,8 @@ random.seed(seed)
 np.random.seed(seed)
 torch.manual_seed(seed)
 
-# ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 CONFIG = {
     "checkpoint_dir": "/ceph/project/P8_DCASE/models/2026/domain_autoencoder_slider_0_2s_self_10",
@@ -97,16 +115,16 @@ CONFIG = {
     "val_split_seed": 42,
 
     # Loss weights
-    #   lambda_recon    – reconstruction fidelity (all samples)
-    #   lambda_compact  – plain intra-cluster variance (set 0 to rely on proto only)
-    #   lambda_separate – prototypical contrastive loss + hard centroid push
-    #   lambda_repel    – push "other" samples away from target centroids
+    #   lambda_recon    ÔÇô reconstruction fidelity (all samples)
+    #   lambda_compact  ÔÇô plain intra-cluster variance (set 0 to rely on proto only)
+    #   lambda_separate ÔÇô prototypical contrastive loss + hard centroid push
+    #   lambda_repel    ÔÇô push "other" samples away from target centroids
     "lambda_recon":    1.0,
     "lambda_compact":  0.0,
     "lambda_separate": 1.0,
     "lambda_repel":    0.8,
 
-    # Softmax temperature for the prototypical loss (range 0.05–0.2).
+    # Softmax temperature for the prototypical loss (range 0.05ÔÇô0.2).
     "proto_temperature": 0.2,
 
     # Minimum distance "other" samples must keep from any target centroid.
@@ -369,587 +387,12 @@ class StereoTemporalConsistencyLoss(nn.Module):
         return (1.0 - cos_sim / self.temperature).mean()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DATASET
-# ─────────────────────────────────────────────────────────────────────────────
+# Shared dataset discovery and validation helpers live in audio_encoder/utils/dataloader.py.
 
-class DCASEAudioDataset(torch.utils.data.Dataset):
-    def __init__(self, samples: list, sample_rate: int = 16_000,
-                 window_sec: float = 5.0, mode: str = "train",
-                 crops_per_sample: int = 1,
-                 preload_to_ram: bool = False,
-                 preload_max_ram_bytes: Optional[int] = None):
-        self.samples = samples
-        self.sample_rate = sample_rate
-        self.window_samples = int(sample_rate * window_sec)
-        self.mode = mode
-        self.crops_per_sample = max(1, int(crops_per_sample)) if mode == "train" else 1
-        self._dcase = DCASE_Dataset()
-        self.preload_to_ram = bool(preload_to_ram)
-        self.preload_max_ram_bytes = (
-            int(preload_max_ram_bytes)
-            if preload_max_ram_bytes is not None
-            else None
-        )
-        self._audio_cache: Dict[str, np.ndarray] = {}
-        self._cached_bytes = 0
 
-        if self.preload_to_ram:
-            self._preload_audio_cache()
-
-    def __len__(self) -> int:
-        return len(self.samples) * self.crops_per_sample
-
-    def _crop(self, audio: np.ndarray) -> np.ndarray:
-        win = self.window_samples
-        if audio.ndim == 1:
-            audio = audio[None, :]
-
-        if audio.shape[-1] <= win:
-            pad = win - audio.shape[-1]
-            return np.pad(audio, ((0, 0), (0, pad)), mode="reflect")
-
-        start = (
-            np.random.randint(0, audio.shape[-1] - win)
-            if self.mode == "train"
-            else (audio.shape[-1] - win) // 2
-        )
-        return audio[:, start: start + win]
-
-    def _load_stereo_audio(self, file_path: str):
-        try:
-            audio, sr = librosa.load(file_path, sr=None, mono=False)
-            return audio, sr
-        except Exception:
-            return None, None
-
-    def _resample_audio(self, audio: np.ndarray, sr: int) -> np.ndarray:
-        if sr == self.sample_rate:
-            return audio
-        if audio.ndim == 1:
-            return librosa.resample(audio, orig_sr=sr, target_sr=self.sample_rate)
-        return np.stack([
-            librosa.resample(audio[ch], orig_sr=sr, target_sr=self.sample_rate)
-            for ch in range(audio.shape[0])
-        ], axis=0)
-
-    def _prepare_base_audio(self, file_path: str) -> np.ndarray:
-        audio, sr = self._load_stereo_audio(file_path)
-        if audio is None:
-            return np.zeros((2, self.window_samples), dtype=np.float32)
-        audio = self._resample_audio(audio, sr).astype(np.float32)
-        if audio.ndim == 1:
-            audio = audio[None, :]
-        return audio
-
-    def _preload_audio_cache(self) -> None:
-        unique_paths = []
-        seen = set()
-        for path, _, _ in self.samples:
-            if path in seen:
-                continue
-            seen.add(path)
-            unique_paths.append(path)
-
-        loaded = 0
-        for path in unique_paths:
-            audio = self._prepare_base_audio(path)
-            n_bytes = int(audio.nbytes)
-
-            if (
-                self.preload_max_ram_bytes is not None
-                and self._cached_bytes + n_bytes > self.preload_max_ram_bytes
-            ):
-                logger.info(
-                    f"[{self.mode}] RAM preload cap reached at "
-                    f"{loaded}/{len(unique_paths)} files "
-                    f"({self._cached_bytes / (1024 ** 3):.2f} GiB cached)."
-                )
-                break
-
-            self._audio_cache[path] = audio
-            self._cached_bytes += n_bytes
-            loaded += 1
-
-        logger.info(
-            f"[{self.mode}] RAM preload: {loaded}/{len(unique_paths)} files "
-            f"cached ({self._cached_bytes / (1024 ** 3):.2f} GiB)."
-        )
-
-    def _get_base_audio(self, file_path: str) -> np.ndarray:
-        if not self.preload_to_ram:
-            return self._prepare_base_audio(file_path)
-        audio = self._audio_cache.get(file_path)
-        if audio is not None:
-            return audio
-        return self._prepare_base_audio(file_path)
-
-    def _to_three_channel_input(self, audio: np.ndarray) -> np.ndarray:
-        # Accept mono/stereo and always convert to [ch1, ch2, ch1-ch2].
-        if audio.ndim == 1:
-            ch1 = audio.astype(np.float32)
-            ch2 = audio.astype(np.float32)
-        else:
-            if audio.shape[0] == 1:
-                ch1 = audio[0].astype(np.float32)
-                ch2 = audio[0].astype(np.float32)
-            else:
-                ch1 = audio[0].astype(np.float32)
-                ch2 = audio[1].astype(np.float32)
-        residual = ch1 - ch2
-        return np.stack([ch1, ch2, residual], axis=0).astype(np.float32)
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int, int]:
-        base_idx = idx // self.crops_per_sample
-        file_path, machine_label, domain_label = self.samples[base_idx]
-
-        audio = self._get_base_audio(file_path)
-        audio = self._crop(audio)
-        audio = self._to_three_channel_input(audio)
-        return torch.from_numpy(audio), int(machine_label), int(domain_label)
-
-
-class AUCValidationDataset(torch.utils.data.Dataset):
-    def __init__(self, samples: list, sample_rate: int = 16_000,
-                 window_sec: float = 5.0, use_sliding_windows: bool = False,
-                 num_windows: int = 5):
-        self.samples = samples
-        self.sample_rate = sample_rate
-        self.window_samples = int(sample_rate * window_sec)
-        self.use_sliding_windows = bool(use_sliding_windows)
-        self.num_windows = max(1, int(num_windows))
-        self._dcase = DCASE_Dataset()
-
-        if self.use_sliding_windows:
-            self.window_to_sample_idx = []
-            for sample_idx in range(len(self.samples)):
-                for window_idx in range(self.num_windows):
-                    self.window_to_sample_idx.append((sample_idx, window_idx))
-        else:
-            self.window_to_sample_idx = [(i, 0) for i in range(len(self.samples))]
-
-    def __len__(self) -> int:
-        return len(self.window_to_sample_idx)
-
-    def _sliding_window_crop(self, audio: np.ndarray, window_idx: int) -> np.ndarray:
-        win = self.window_samples
-        if audio.shape[-1] <= win:
-            pad = win - audio.shape[-1]
-            return np.pad(audio, ((0, 0), (0, pad)), mode="reflect")
-
-        total_length = audio.shape[-1]
-        if self.num_windows <= 1:
-            start = (total_length - win) // 2
-        else:
-            stride = max(1, (total_length - win) // (self.num_windows - 1))
-            start = min(window_idx * stride, total_length - win)
-        return audio[:, start:start + win]
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        sample_idx, window_idx = self.window_to_sample_idx[idx]
-        file_path, label = self.samples[sample_idx]
-
-        try:
-            audio, sr = librosa.load(file_path, sr=None, mono=False)
-        except Exception:
-            audio, sr = None, None
-
-        if audio is None:
-            audio = np.zeros((2, self.window_samples), dtype=np.float32)
-            sr = self.sample_rate
-
-        if sr != self.sample_rate:
-            if audio.ndim == 1:
-                audio = librosa.resample(audio, orig_sr=sr, target_sr=self.sample_rate)
-            else:
-                audio = np.stack([
-                    librosa.resample(audio[ch], orig_sr=sr, target_sr=self.sample_rate)
-                    for ch in range(audio.shape[0])
-                ], axis=0)
-
-        if audio.ndim == 1:
-            audio = audio[None, :]
-        if audio.shape[0] == 1:
-            audio = np.concatenate([audio, audio], axis=0)
-
-        audio = audio.astype(np.float32)
-        if self.use_sliding_windows:
-            audio = self._sliding_window_crop(audio, window_idx)
-        else:
-            if audio.shape[-1] > self.window_samples:
-                start = (audio.shape[-1] - self.window_samples) // 2
-                audio = audio[:, start:start + self.window_samples]
-            elif audio.shape[-1] < self.window_samples:
-                pad = self.window_samples - audio.shape[-1]
-                audio = np.pad(audio, ((0, 0), (0, pad)), mode="reflect")
-
-        ch1 = audio[0]
-        ch2 = audio[1]
-        residual = ch1 - ch2
-        audio_3ch = np.stack([ch1, ch2, residual], axis=0).astype(np.float32)
-        return torch.from_numpy(audio_3ch), int(label), int(sample_idx)
-
-
-def _is_anomaly(filename: str) -> int:
-    name = filename.lower()
-    if "anomaly" in name or "abnormal" in name:
-        return 1
-    if "normal" in name:
-        return 0
-    return -1
-
-
-def _find_machine_root(data_root: str, machine: str) -> Optional[str]:
-    if not os.path.exists(data_root):
-        return None
-    return next((d for d in os.listdir(data_root) if d.lower() == machine.lower()), None)
-
-
-def _path_has_machine_segment(path: str, machine: str) -> bool:
-    machine_l = machine.lower()
-    parts = os.path.normpath(path).replace("\\", "/").split("/")
-    return any(part.lower() == machine_l for part in parts)
-
-
-def discover_target_test_samples(machine: str, data_root: str) -> list:
-    samples = []
-    dcase = DCASE_Dataset()
-    machine_root = _find_machine_root(data_root, machine)
-    if machine_root is None:
-        logger.warning(f"No data folder found for machine '{machine}' in {data_root}")
-        return samples
-
-    test_dir = None
-    for candidate in ("test", "test_data"):
-        path = os.path.join(data_root, machine_root, candidate)
-        if os.path.isdir(path):
-            test_dir = path
-            break
-
-    if test_dir is None:
-        logger.warning(f"No test folder found for '{machine}'")
-        return samples
-
-    for fname in os.listdir(test_dir):
-        if not fname.endswith(".wav"):
-            continue
-        label = _is_anomaly(fname)
-        if label < 0:
-            continue
-        path = os.path.join(test_dir, fname)
-        domain_str = dcase.build_domain(fname, machine)
-        samples.append((path, 1, domain_str))
-
-    logger.info(f"Target test: {len(samples)} files for '{machine}'")
-    return samples
-
-
-def discover_target_test_auc_samples(machine: str, data_root: str) -> list:
-    samples = []
-    machine_root = _find_machine_root(data_root, machine)
-    if machine_root is None:
-        return samples
-
-    test_dir = None
-    for candidate in ("test", "test_data"):
-        path = os.path.join(data_root, machine_root, candidate)
-        if os.path.isdir(path):
-            test_dir = path
-            break
-
-    if test_dir is None:
-        return samples
-
-    for fname in os.listdir(test_dir):
-        if not fname.endswith(".wav"):
-            continue
-        label = _is_anomaly(fname)
-        if label < 0:
-            continue
-        samples.append((os.path.join(test_dir, fname), label))
-    return samples
-
-
-def aggregate_windowed_embeddings(model, dataloader, device, aggregation: str,
-                                  return_labels: bool):
-    model.eval()
-    window_embeddings = {}
-    with torch.no_grad():
-        for audio, labels, sample_idxs in dataloader:
-            audio = audio.to(device)
-            z = model.module.get_embeddings(audio) if hasattr(model, "module") else model.get_embeddings(audio)
-            emb_np = z.cpu().numpy()
-            if isinstance(sample_idxs, torch.Tensor):
-                sample_idxs = sample_idxs.tolist()
-            for i, sample_idx in enumerate(sample_idxs):
-                if sample_idx not in window_embeddings:
-                    window_embeddings[sample_idx] = []
-                window_embeddings[sample_idx].append(emb_np[i])
-
-    if not window_embeddings:
-        return (None, None) if return_labels else None
-
-    samples = getattr(dataloader.dataset, "samples", None)
-    emb_list = []
-    lbl_list = []
-    for sample_idx in sorted(window_embeddings.keys()):
-        windows = np.array(window_embeddings[sample_idx])
-        if aggregation == "max":
-            agg_emb = np.max(windows, axis=0)
-        else:
-            agg_emb = np.mean(windows, axis=0)
-        emb_list.append(agg_emb)
-        if return_labels and samples is not None and sample_idx < len(samples):
-            lbl_list.append(samples[sample_idx][1])
-
-    emb = np.vstack(emb_list)
-    if return_labels:
-        labels = np.array(lbl_list, dtype=int)
-        return emb, labels
-    return emb
-
-
-def generate_reference_embeddings(model, dataloader, device, cfg, limit: int = 40_000):
-    if cfg.get("auc_val_sliding_window", False):
-        samples = getattr(dataloader.dataset, "samples", None)
-        if not samples:
-            return None
-        if len(samples[0]) >= 1:
-            ref_samples = [(path, 0) for path, *_ in samples][:limit]
-        else:
-            return None
-
-        ref_ds = AUCValidationDataset(
-            ref_samples,
-            cfg["sample_rate"],
-            cfg["max_audio_len_sec"],
-            use_sliding_windows=True,
-            num_windows=cfg.get("auc_val_num_windows", 5),
-        )
-        ref_loader = DataLoader(
-            ref_ds,
-            batch_size=cfg.get("auc_val_batch_size", 16),
-            shuffle=False,
-            num_workers=cfg.get("num_workers", 0),
-            pin_memory=True,
-        )
-        return aggregate_windowed_embeddings(
-            model,
-            ref_loader,
-            device,
-            aggregation=str(cfg.get("auc_val_aggregation", "mean")).lower(),
-            return_labels=False,
-        )
-
-    model.eval()
-    embeddings = []
-    seen = 0
-    with torch.no_grad():
-        for audio, _, _ in dataloader:
-            if seen >= limit:
-                break
-            audio = audio.to(device)
-            z = model.module.get_embeddings(audio) if hasattr(model, "module") else model.get_embeddings(audio)
-            embeddings.append(z.cpu().numpy())
-            seen += len(audio)
-    if not embeddings:
-        return None
-    return np.vstack(embeddings)[:limit]
-
-
-def validate_auc(model, dataloader, reference_embeddings, device, cfg, rank: int = 0):
-    if dataloader is None or reference_embeddings is None or len(reference_embeddings) == 0:
-        return 0.0
-
-    if cfg.get("auc_val_sliding_window", False):
-        q_emb, q_lbl = aggregate_windowed_embeddings(
-            model,
-            dataloader,
-            device,
-            aggregation=str(cfg.get("auc_val_aggregation", "mean")).lower(),
-            return_labels=True,
-        )
-        if q_emb is None or q_lbl is None:
-            return 0.0
-    else:
-        model.eval()
-        query_embeddings, query_labels = [], []
-        with torch.no_grad():
-            for audio, labels in dataloader:
-                audio = audio.to(device)
-                z = model.module.get_embeddings(audio) if hasattr(model, "module") else model.get_embeddings(audio)
-                query_embeddings.append(z.cpu().numpy())
-                query_labels.append(labels.numpy())
-
-        if not query_embeddings:
-            return 0.0
-
-        q_emb = np.vstack(query_embeddings)
-        q_lbl = np.concatenate(query_labels)
-    if len(np.unique(q_lbl)) < 2:
-        logger.warning("AUC validation skipped because the target test set has only one class.")
-        return 0.5
-
-    n_neighbors = min(cfg.get("auc_val_n_neighbors", 2), len(reference_embeddings))
-    n_neighbors = max(1, n_neighbors)
-
-    scaler = StandardScaler()
-    ref_scaled = scaler.fit_transform(reference_embeddings)
-    q_scaled = scaler.transform(q_emb)
-
-    nn_model = NearestNeighbors(n_neighbors=n_neighbors, metric="euclidean")
-    nn_model.fit(ref_scaled)
-    distances, _ = nn_model.kneighbors(q_scaled)
-    scores = distances[:, 0]
-
-    try:
-        auc = roc_auc_score(q_lbl, scores)
-    except ValueError as exc:
-        logger.warning(f"AUC calculation failed: {exc}")
-        return 0.5
-
-    if rank == 0:
-        n_norm = int((q_lbl == 0).sum())
-        n_anom = int((q_lbl == 1).sum())
-        logger.info(f"   AUC: {auc:.4f}  ({n_norm} normal / {n_anom} anomaly)")
-    return auc
-
-
-def build_datasets(cfg: dict, rank: int = 0):
-    target = cfg["target_machine"].lower()
-    dcase  = DCASE_Dataset()
-    all_samples = dcase.discover_train()
-    target_test_samples_raw = discover_target_test_samples(target, dcase.data_path)
-
-    inv_domain_map = {v: k for k, v in dcase.domain_map.items()}
-
-    target_domain_strings = sorted({
-        inv_domain_map[dom_id]
-        for path, _, dom_id in all_samples
-        if _path_has_machine_segment(path, target) and dom_id in inv_domain_map
-    })
-
-    domain_str_to_new_id = {s: i + 1 for i, s in enumerate(target_domain_strings)}
-    domain_label_to_name = {0: "other"}
-    domain_label_to_name.update({v: k for k, v in domain_str_to_new_id.items()})
-
-    target_test_samples = []
-    for path, machine_label, domain_str in target_test_samples_raw:
-        new_dom = domain_str_to_new_id.get(domain_str, 0)
-        target_test_samples.append((path, machine_label, new_dom))
-
-    if rank == 0:
-        logger.info(f"Target machine  : '{target}'")
-        logger.info(f"Target domains  : {len(target_domain_strings)}")
-        for new_id, name in sorted(domain_label_to_name.items()):
-            logger.info(f"  label {new_id:3d} → {name}")
-
-    target_samples, other_samples, aug_samples = [], [], []
-
-    for path, class_id, dom_id in all_samples:
-        filename  = os.path.basename(path)
-        is_target = _path_has_machine_segment(path, target)
-
-        if is_target:
-            dom_str       = inv_domain_map.get(dom_id, "")
-            new_dom       = domain_str_to_new_id.get(dom_str, 0)
-            machine_label = 1
-        else:
-            new_dom       = 0
-            machine_label = 0
-
-        entry = (path, machine_label, new_dom)
-
-        if dcase.detect_augmentation(filename) != "original":
-            aug_samples.append(entry)
-        elif is_target:
-            target_samples.append(entry)
-        else:
-            other_samples.append(entry)
-
-    oversample    = cfg.get("target_oversample", 10)
-    train_samples = target_samples * oversample + other_samples + aug_samples
-    val_samples   = target_test_samples
-
-    if rank == 0:
-        logger.info(
-            f"Train  — target: {len(target_samples)} x{oversample}, "
-            f"other: {len(other_samples)}, aug: {len(aug_samples)}"
-        )
-        logger.info(
-            f"Train crops/sample: {cfg.get('train_crops_per_sample', 1)} "
-            f"(effective train size: {len(train_samples) * cfg.get('train_crops_per_sample', 1)})"
-        )
-        logger.info(f"Val    — target test: {len(target_test_samples)}")
-
-    preload_enabled = bool(cfg.get("preload_audio_to_ram", False))
-    preload_train_only = bool(cfg.get("preload_train_only", True))
-    preload_max_ram_gb = cfg.get("preload_max_ram_gb", None)
-    preload_max_ram_bytes = None
-    if preload_max_ram_gb is not None:
-        preload_max_ram_bytes = int(float(preload_max_ram_gb) * (1024 ** 3))
-
-    if rank == 0 and preload_enabled:
-        cap_str = (
-            f"{float(preload_max_ram_gb):.2f} GiB"
-            if preload_max_ram_gb is not None
-            else "unbounded"
-        )
-        logger.info(
-            f"RAM preload enabled (train_only={preload_train_only}, cap={cap_str})."
-        )
-
-    window_sec = cfg["max_audio_len_sec"]
-    train_ds   = DCASEAudioDataset(
-        train_samples,
-        cfg["sample_rate"],
-        window_sec,
-        "train",
-        crops_per_sample=cfg.get("train_crops_per_sample", 1),
-        preload_to_ram=preload_enabled,
-        preload_max_ram_bytes=preload_max_ram_bytes,
-    )
-    preload_eval = preload_enabled and not preload_train_only
-    val_ds     = DCASEAudioDataset(
-        val_samples,
-        cfg["sample_rate"],
-        window_sec,
-        "val",
-        preload_to_ram=preload_eval,
-        preload_max_ram_bytes=preload_max_ram_bytes,
-    )
-    reference_ds = DCASEAudioDataset(
-        target_samples,
-        cfg["sample_rate"],
-        window_sec,
-        "val",
-        preload_to_ram=preload_eval,
-        preload_max_ram_bytes=preload_max_ram_bytes,
-    )
-    auc_val_ds = AUCValidationDataset(
-        discover_target_test_auc_samples(target, dcase.data_path),
-        cfg["sample_rate"], window_sec,
-        use_sliding_windows=cfg.get("auc_val_sliding_window", False),
-        num_windows=cfg.get("auc_val_num_windows", 5),
-    )
-
-    # t-SNE dataset: all originals without oversampling for a faithful picture
-    tsne_raw = target_test_samples + target_samples + other_samples[:len(target_test_samples) + len(target_samples)]
-    tsne_ds  = DCASEAudioDataset(
-        tsne_raw,
-        cfg["sample_rate"],
-        window_sec,
-        "val",
-        preload_to_ram=preload_eval,
-        preload_max_ram_bytes=preload_max_ram_bytes,
-    )
-
-    return train_ds, val_ds, tsne_ds, reference_ds, auc_val_ds, domain_label_to_name
-
-
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # t-SNE VISUALISATION
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 def collect_embeddings(model, dataloader, device, max_samples: int = 3000):
     model.eval()
@@ -973,11 +416,11 @@ def save_tsne_plot(model, dataloader, device, epoch: int,
                    domain_label_to_name: dict, plot_dir: str,
                    max_samples: int = 3000):
     os.makedirs(plot_dir, exist_ok=True)
-    logger.info(f"Generating t-SNE plot for epoch {epoch} …")
+    logger.info(f"Generating t-SNE plot for epoch {epoch} ÔÇª")
 
     zs, domains = collect_embeddings(model, dataloader, device, max_samples)
     if zs is None:
-        logger.warning("No embeddings collected — skipping t-SNE.")
+        logger.warning("No embeddings collected ÔÇö skipping t-SNE.")
         return
 
     present       = sorted(np.unique(domains).astype(int))
@@ -1012,7 +455,7 @@ def save_tsne_plot(model, dataloader, device, epoch: int,
                    label=label, zorder=2)
         colour_idx += 1
 
-    ax.set_title(f"t-SNE — domain embeddings — Epoch {epoch}", fontsize=13)
+    ax.set_title(f"t-SNE ÔÇö domain embeddings ÔÇö Epoch {epoch}", fontsize=13)
     ax.set_xlabel("t-SNE dim 1")
     ax.set_ylabel("t-SNE dim 2")
     ax.legend(loc="upper right", markerscale=2, fontsize=7,
@@ -1026,9 +469,9 @@ def save_tsne_plot(model, dataloader, device, epoch: int,
     logger.info(f"   t-SNE plot saved: {save_path}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # TRAINING
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 def log_loss_breakdown(epoch, batch_idx, total, recon, compact, separate, repel, consist):
     logger.info(
@@ -1155,9 +598,9 @@ def run_epoch(model, dataloader, optimizer, device, epoch, cfg, rank,
             # Reconstruction loss: all samples (target + other)
             loss_recon = recon_crit(x_in, x_hat)
 
-            # Temporal consistency loss: two crops of the same clip → same z.
+            # Temporal consistency loss: two crops of the same clip ÔåÆ same z.
             # Passed as (model, raw_audio) so the loss re-runs the encoder on
-            # both halves internally.  The decoder is NOT run on the crops —
+            # both halves internally.  The decoder is NOT run on the crops ÔÇö
             # this is encoder-only and adds no extra decoder computation.
             if cfg.get("lambda_consistency", 0.0) > 0:
                 loss_consistency = consistency_crit(
@@ -1170,9 +613,9 @@ def run_epoch(model, dataloader, optimizer, device, epoch, cfg, rank,
             # Clustering losses: pass the full z batch so the repulsion term
             # can act on "other" samples too.
             # DomainClusteringLoss returns exactly 3 values:
-            #   loss_compact  – intra-cluster variance (monitoring)
-            #   loss_separate – proto contrastive + hard centroid push
-            #   loss_repel    – push "other" away from target centroids
+            #   loss_compact  ÔÇô intra-cluster variance (monitoring)
+            #   loss_separate ÔÇô proto contrastive + hard centroid push
+            #   loss_repel    ÔÇô push "other" away from target centroids
             cluster_labels = domain_labels
             if cfg.get("unsupervised_clustering", False) and centroids is not None:
                 cluster_labels = assign_pseudo_labels(z, machine_labels, centroids)
@@ -1305,7 +748,7 @@ def training_loop(model, train_loader, val_loader, tsne_loader, auc_val_loader,
                     state = model.module.state_dict() if hasattr(model, "module") \
                             else model.state_dict()
                     torch.save(state, best_model_path)
-                    logger.info(f"   ★ NEW BEST AUC: {best_auc:.4f}")
+                    logger.info(f"   Ôÿà NEW BEST AUC: {best_auc:.4f}")
                     improved = True
             else:
                 if val_loss < best_val_loss:
@@ -1313,7 +756,7 @@ def training_loop(model, train_loader, val_loader, tsne_loader, auc_val_loader,
                     state = model.module.state_dict() if hasattr(model, "module") \
                             else model.state_dict()
                     torch.save(state, best_model_path)
-                    logger.info(f"   ★ NEW BEST Val Loss: {best_val_loss:.4f}")
+                    logger.info(f"   Ôÿà NEW BEST Val Loss: {best_val_loss:.4f}")
                     improved = True
 
             if improved:
@@ -1342,9 +785,9 @@ def training_loop(model, train_loader, val_loader, tsne_loader, auc_val_loader,
         logger.info(f"Best model: {best_model_path}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # ENTRY POINT
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 def main():
     if "RANK" in os.environ:
@@ -1354,11 +797,11 @@ def main():
         torch.cuda.set_device(local_rank)
         device     = torch.device("cuda", local_rank)
         if dist.get_rank() == 0:
-            logger.info(f"DDP — world_size={dist.get_world_size()}")
+            logger.info(f"DDP ÔÇö world_size={dist.get_world_size()}")
     else:
         rank   = 0
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(f"Single-process — device={device}")
+        logger.info(f"Single-process ÔÇö device={device}")
 
     cfg = CONFIG
     os.makedirs(cfg["checkpoint_dir"], exist_ok=True)
@@ -1369,7 +812,7 @@ def main():
         for k, v in cfg.items():
             logger.info(f"  {k}: {v}")
 
-    train_ds, val_ds, tsne_ds, reference_ds, auc_val_ds, domain_label_to_name = build_datasets(cfg, rank=rank)
+    train_ds, val_ds, tsne_ds, reference_ds, auc_val_ds, domain_label_to_name = build_datasets_from_utils(cfg, rank=rank)
     cfg["num_domains"] = len(domain_label_to_name) - 1
 
     train_sampler = DistributedSampler(train_ds, shuffle=True) \

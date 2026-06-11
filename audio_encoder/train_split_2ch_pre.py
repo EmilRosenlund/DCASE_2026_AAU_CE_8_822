@@ -89,7 +89,7 @@ CONFIG = {
 
     # Target machine — must match one of DCASE_Dataset.machines exactly:
     #   fan | valve | slider | ToyCar | ToyCarEmu | gearbox | bearing
-    "target_machine": "bearingEmu",
+    "target_machine": "bearing",
 
     # Architecture
     "latent_dim": 256,
@@ -102,8 +102,8 @@ CONFIG = {
     "train_crops_per_sample": 8, #
 
     # Optional RAM preload for faster repeated crops from the same files.
-    "preload_audio_to_ram": True,
-    "preload_train_only": True,
+    "preload_audio_to_ram": False,
+    "preload_train_only": False,
     "preload_max_ram_gb": 20.0,
     "preload_num_workers": 8,
 
@@ -163,7 +163,7 @@ CONFIG = {
     "patience": 100,
 
     # Resume
-    "resume_checkpoint": "/ceph/project/P8_DCASE/models/2026/domain_autoencoder_bearingEmu/best_model_auc.pt"  # Path to .pth to resume from, or empty string to start fresh.
+    "resume_checkpoint": ""  # Path to .pth to resume from, or empty string to start fresh.
 }
 
 local_env = False

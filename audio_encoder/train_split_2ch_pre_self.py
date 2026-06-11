@@ -1,22 +1,8 @@
 ﻿"""
 train_domain_autoencoder.py
-ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+
 Single-machine domain autoencoder.                                          project/simple_autoencoder/train_split_2ch_pre_self.py
-#                                                                               Need to change auc val to not just a center crop
-Goal: encode one target machine's domains into distinct, separated clusters
-in latent space. All other machines are collapsed to a single "other" class
-(domain_label = 0) and are excluded from both clustering losses ÔÇö the
-autoencoder simply reconstructs them without trying to cluster them.
-
-Domain label convention
-  0          ÔåÆ "other" (every machine that is NOT the target machine)
-  1 ÔÇª K      ÔåÆ domain IDs for the target machine (re-indexed from 1)
-
-The DomainClusteringLoss only operates on samples where domain_label > 0.
-
-t-SNE plots are saved to /ceph/project/P8_DCASE/plots every N epochs.
 """
-
 import sys
 import os
 import math
@@ -43,7 +29,7 @@ from sklearn.manifold import TSNE
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 
-# ÔöÇÔöÇ project imports ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_dir = os.path.dirname(os.path.dirname(current_dir))
 sys.path.append(os.path.join(project_dir, "project", "utils"))
@@ -88,7 +74,7 @@ CONFIG = {
 
     
     #   fan | valve | slider | ToyCar | ToyCarEmu | gearbox | bearing
-    "target_machine": "sliderEmu",
+    "target_machine": "slider",
 
     # Architecture
     "latent_dim": 256,
@@ -101,8 +87,8 @@ CONFIG = {
     "train_crops_per_sample": 40, #
 
     # Optional RAM preload for faster repeated crops from the same files.
-    "preload_audio_to_ram": True,
-    "preload_train_only": True,
+    "preload_audio_to_ram": False,
+    "preload_train_only": False,
     "preload_max_ram_gb": 20.0,
 
     # Training
@@ -115,16 +101,12 @@ CONFIG = {
     "val_split_seed": 42,
 
     # Loss weights
-    #   lambda_recon    ÔÇô reconstruction fidelity (all samples)
-    #   lambda_compact  ÔÇô plain intra-cluster variance (set 0 to rely on proto only)
-    #   lambda_separate ÔÇô prototypical contrastive loss + hard centroid push
-    #   lambda_repel    ÔÇô push "other" samples away from target centroids
     "lambda_recon":    1.0,
     "lambda_compact":  0.0,
     "lambda_separate": 1.0,
     "lambda_repel":    0.8,
 
-    # Softmax temperature for the prototypical loss (range 0.05ÔÇô0.2).
+    # Softmax temperature for the prototypical loss (range 0.05 - 0.2)
     "proto_temperature": 0.2,
 
     # Minimum distance "other" samples must keep from any target centroid.
@@ -416,11 +398,11 @@ def save_tsne_plot(model, dataloader, device, epoch: int,
                    domain_label_to_name: dict, plot_dir: str,
                    max_samples: int = 3000):
     os.makedirs(plot_dir, exist_ok=True)
-    logger.info(f"Generating t-SNE plot for epoch {epoch} ÔÇª")
+    logger.info(f"Generating t-SNE plot for epoch {epoch} ...")
 
     zs, domains = collect_embeddings(model, dataloader, device, max_samples)
     if zs is None:
-        logger.warning("No embeddings collected ÔÇö skipping t-SNE.")
+        logger.warning("No embeddings collected ... skipping t-SNE.")
         return
 
     present       = sorted(np.unique(domains).astype(int))
@@ -455,7 +437,7 @@ def save_tsne_plot(model, dataloader, device, epoch: int,
                    label=label, zorder=2)
         colour_idx += 1
 
-    ax.set_title(f"t-SNE ÔÇö domain embeddings ÔÇö Epoch {epoch}", fontsize=13)
+    ax.set_title(f"t-SNE — domain embeddings — Epoch {epoch}", fontsize=13)
     ax.set_xlabel("t-SNE dim 1")
     ax.set_ylabel("t-SNE dim 2")
     ax.legend(loc="upper right", markerscale=2, fontsize=7,
@@ -600,7 +582,7 @@ def run_epoch(model, dataloader, optimizer, device, epoch, cfg, rank,
 
             # Temporal consistency loss: two crops of the same clip ÔåÆ same z.
             # Passed as (model, raw_audio) so the loss re-runs the encoder on
-            # both halves internally.  The decoder is NOT run on the crops ÔÇö
+            # both halves internally.  The decoder is NOT run on the crops 
             # this is encoder-only and adds no extra decoder computation.
             if cfg.get("lambda_consistency", 0.0) > 0:
                 loss_consistency = consistency_crit(
@@ -613,9 +595,9 @@ def run_epoch(model, dataloader, optimizer, device, epoch, cfg, rank,
             # Clustering losses: pass the full z batch so the repulsion term
             # can act on "other" samples too.
             # DomainClusteringLoss returns exactly 3 values:
-            #   loss_compact  ÔÇô intra-cluster variance (monitoring)
-            #   loss_separate ÔÇô proto contrastive + hard centroid push
-            #   loss_repel    ÔÇô push "other" away from target centroids
+            #   loss_compact  - intra-cluster variance (monitoring)
+            #   loss_separate - proto contrastive + hard centroid push
+            #   loss_repel    - push "other" away from target centroids
             cluster_labels = domain_labels
             if cfg.get("unsupervised_clustering", False) and centroids is not None:
                 cluster_labels = assign_pseudo_labels(z, machine_labels, centroids)
@@ -748,7 +730,7 @@ def training_loop(model, train_loader, val_loader, tsne_loader, auc_val_loader,
                     state = model.module.state_dict() if hasattr(model, "module") \
                             else model.state_dict()
                     torch.save(state, best_model_path)
-                    logger.info(f"   Ôÿà NEW BEST AUC: {best_auc:.4f}")
+                    logger.info(f"   — NEW BEST AUC: {best_auc:.4f}")
                     improved = True
             else:
                 if val_loss < best_val_loss:
@@ -756,7 +738,7 @@ def training_loop(model, train_loader, val_loader, tsne_loader, auc_val_loader,
                     state = model.module.state_dict() if hasattr(model, "module") \
                             else model.state_dict()
                     torch.save(state, best_model_path)
-                    logger.info(f"   Ôÿà NEW BEST Val Loss: {best_val_loss:.4f}")
+                    logger.info(f"   — NEW BEST Val Loss: {best_val_loss:.4f}")
                     improved = True
 
             if improved:
@@ -797,11 +779,11 @@ def main():
         torch.cuda.set_device(local_rank)
         device     = torch.device("cuda", local_rank)
         if dist.get_rank() == 0:
-            logger.info(f"DDP ÔÇö world_size={dist.get_world_size()}")
+            logger.info(f"DDP — world_size={dist.get_world_size()}")
     else:
         rank   = 0
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(f"Single-process ÔÇö device={device}")
+        logger.info(f"Single-process — device={device}")
 
     cfg = CONFIG
     os.makedirs(cfg["checkpoint_dir"], exist_ok=True)

@@ -1,5 +1,6 @@
 import os
 import re
+import logging
 import librosa
 import numpy as np
 import scipy.io.wavfile as wav
@@ -13,10 +14,13 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import NearestNeighbors
 from sklearn.metrics import roc_auc_score
 
+
+logger = logging.getLogger(__name__)
+
 class DCASE_Dataset:
     def __init__(self, debug=False):
         self.debug = debug
-        self.local_env = False  # Set to False when running on cluster with actual paths
+        self.local_env = True  # Set to False when running on cluster with actual paths
         
         if self.local_env:
             self.data_path = r"C:\Users\emilr\Documents\GitHub\Semester8\DCASE\data"
@@ -25,8 +29,8 @@ class DCASE_Dataset:
             self.data_path = "/ceph/project/P8_DCASE/data_2026"
             self.aug_base_dir = "/ceph/project/P8_DCASE/data_2026_AUG"
 
-        #self.machines = ["fan", "valve", "slider", "ToyCar", "ToyTrain", "gearbox", "bearing"]
-        self.machines = ["fan", "valveEmu", "sliderEmu", "ToyCarEmu", "ToyCar", "gearboxEmu", "bearingEmu"]
+        self.machines = ["fan", "valve", "slider", "ToyCar", "ToyTrain", "gearbox", "bearing"]
+        #self.machines = ["fan", "valveEmu", "sliderEmu", "ToyCarEmu", "ToyCar", "gearboxEmu", "bearingEmu"]
         self.class_map = {}
         self.domain_map = {}
 
@@ -641,6 +645,142 @@ def validate_auc(model, dataloader, reference_embeddings, device, cfg, rank: int
         return 0.5
 
     return auc
+
+
+def build_datasets(cfg: dict, rank: int = 0):
+    target = cfg["target_machine"].lower()
+    dcase = DCASE_Dataset()
+    all_samples = dcase.discover_train()
+    target_test_samples_raw = discover_target_test_samples(target, dcase.data_path)
+
+    inv_domain_map = {v: k for k, v in dcase.domain_map.items()}
+
+    target_domain_strings = sorted({
+        inv_domain_map[dom_id]
+        for path, _, dom_id in all_samples
+        if _path_has_machine_segment(path, target) and dom_id in inv_domain_map
+    })
+
+    domain_str_to_new_id = {s: i + 1 for i, s in enumerate(target_domain_strings)}
+    domain_label_to_name = {0: "other"}
+    domain_label_to_name.update({v: k for k, v in domain_str_to_new_id.items()})
+
+    target_test_samples = []
+    for path, machine_label, domain_str in target_test_samples_raw:
+        new_dom = domain_str_to_new_id.get(domain_str, 0)
+        target_test_samples.append((path, machine_label, new_dom))
+
+    if rank == 0:
+        logger.info(f"Target machine  : '{target}'")
+        logger.info(f"Target domains  : {len(target_domain_strings)}")
+        for new_id, name in sorted(domain_label_to_name.items()):
+            logger.info(f"  label {new_id:3d} → {name}")
+
+    target_samples, other_samples, aug_samples = [], [], []
+
+    for path, class_id, dom_id in all_samples:
+        filename = os.path.basename(path)
+        is_target = _path_has_machine_segment(path, target)
+
+        if is_target:
+            dom_str = inv_domain_map.get(dom_id, "")
+            new_dom = domain_str_to_new_id.get(dom_str, 0)
+            machine_label = 1
+        else:
+            new_dom = 0
+            machine_label = 0
+
+        entry = (path, machine_label, new_dom)
+
+        if dcase.detect_augmentation(filename) != "original":
+            aug_samples.append(entry)
+        elif is_target:
+            target_samples.append(entry)
+        else:
+            other_samples.append(entry)
+
+    oversample = cfg.get("target_oversample", 10)
+    train_samples = target_samples * oversample + other_samples + aug_samples
+    val_samples = target_test_samples
+
+    if rank == 0:
+        logger.info(
+            f"Train  — target: {len(target_samples)} x{oversample}, "
+            f"other: {len(other_samples)}, aug: {len(aug_samples)}"
+        )
+        logger.info(
+            f"Train crops/sample: {cfg.get('train_crops_per_sample', 1)} "
+            f"(effective train size: {len(train_samples) * cfg.get('train_crops_per_sample', 1)})"
+        )
+        logger.info(f"Val    — target test: {len(target_test_samples)}")
+
+    preload_enabled = bool(cfg.get("preload_audio_to_ram", False))
+    preload_train_only = bool(cfg.get("preload_train_only", True))
+    preload_max_ram_gb = cfg.get("preload_max_ram_gb", None)
+    preload_max_ram_bytes = None
+    if preload_max_ram_gb is not None:
+        preload_max_ram_bytes = int(float(preload_max_ram_gb) * (1024 ** 3))
+
+    if rank == 0 and preload_enabled:
+        cap_str = (
+            f"{float(preload_max_ram_gb):.2f} GiB"
+            if preload_max_ram_gb is not None
+            else "unbounded"
+        )
+        logger.info(
+            f"RAM preload enabled (train_only={preload_train_only}, cap={cap_str})."
+        )
+
+    window_sec = cfg["max_audio_len_sec"]
+    train_ds = DCASEAudioDataset(
+        train_samples,
+        cfg["sample_rate"],
+        window_sec,
+        "train",
+        crops_per_sample=cfg.get("train_crops_per_sample", 1),
+        preload_to_ram=preload_enabled,
+        preload_max_ram_bytes=preload_max_ram_bytes,
+        preload_num_workers=cfg.get("preload_num_workers", 1),
+    )
+    preload_eval = preload_enabled and not preload_train_only
+    val_ds = DCASEAudioDataset(
+        val_samples,
+        cfg["sample_rate"],
+        window_sec,
+        "val",
+        preload_to_ram=preload_eval,
+        preload_max_ram_bytes=preload_max_ram_bytes,
+        preload_num_workers=cfg.get("preload_num_workers", 1),
+    )
+    reference_ds = DCASEAudioDataset(
+        target_samples,
+        cfg["sample_rate"],
+        window_sec,
+        "val",
+        preload_to_ram=preload_eval,
+        preload_max_ram_bytes=preload_max_ram_bytes,
+        preload_num_workers=cfg.get("preload_num_workers", 1),
+    )
+    auc_val_ds = AUCValidationDataset(
+        discover_target_test_auc_samples(target, dcase.data_path),
+        cfg["sample_rate"],
+        window_sec,
+        use_sliding_windows=cfg.get("auc_val_sliding_window", False),
+        num_windows=cfg.get("auc_val_num_windows", 5),
+    )
+
+    tsne_raw = target_test_samples + target_samples + other_samples[: len(target_test_samples) + len(target_samples)]
+    tsne_ds = DCASEAudioDataset(
+        tsne_raw,
+        cfg["sample_rate"],
+        window_sec,
+        "val",
+        preload_to_ram=preload_eval,
+        preload_max_ram_bytes=preload_max_ram_bytes,
+        preload_num_workers=cfg.get("preload_num_workers", 1),
+    )
+
+    return train_ds, val_ds, tsne_ds, reference_ds, auc_val_ds, domain_label_to_name
 
 
 if __name__ == "__main__":
